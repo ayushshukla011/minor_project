@@ -1,318 +1,260 @@
-import os
+import numpy as np
+import pandas as pd
 from pathlib import Path
+import pickle
 import warnings
 warnings.filterwarnings("ignore")
 
-import numpy as np
-import pandas as pd
-import pickle
-
-from sklearn.model_selection import train_test_split, RandomizedSearchCV
-from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, StratifiedKFold
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
-    accuracy_score, f1_score, classification_report, confusion_matrix,
-    mean_squared_error, r2_score
+    accuracy_score, f1_score, classification_report, confusion_matrix
 )
 
-import matplotlib.pyplot as plt
-
-# ================== CONFIG ==================
-import argparse, sys
-
-parser = argparse.ArgumentParser(description="Train noise + synthetic vibration ML models")
-parser.add_argument("--data-path", "-d", default="urban_noise_levels.csv",
-                    help="Path to input CSV file (default: %(default)s)")
-parser.add_argument("--out-dir", "-o", default="ml_with_vibration_models",
-                    help="Directory where models/artifacts will be saved (default: %(default)s)")
-parser.add_argument("--random-state", type=int, default=42,
-                    help="Random seed for reproducibility")
-args = parser.parse_args()
-
-DATA_PATH = Path(args.data_path).expanduser()
-if not DATA_PATH.exists() or DATA_PATH.is_dir():
-    print(f"ERROR: data file does not exist or is a directory: {DATA_PATH}", file=sys.stderr)
-    sys.exit(1)
-# use resolved absolute path for clarity
-DATA_PATH = str(DATA_PATH.resolve())
-
-OUT_DIR = Path(args.out_dir).expanduser().resolve()
+# ---------------- CONFIG ----------------
+DATA_PATH = "urban_noise_levels.csv"      # path to kaggle dataset
+OUT_DIR = Path("monument_impact_models")  # where to save model
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+RANDOM_STATE = 42
+# ----------------------------------------
 
-RANDOM_STATE = args.random_state
-NOISE_THRESHOLDS = (60, 75)  # Low <60, Medium 60–75, High >75
-# ===========================================
 
-# 1. Load dataset
+# ---------- 1. Load & basic clean ----------
 print(f"Loading dataset from: {DATA_PATH}")
 df = pd.read_csv(DATA_PATH)
-print("Shape:", df.shape)
-print("Columns:", df.columns.tolist())
-
-# 2. Basic cleaning
 df.columns = [c.strip() for c in df.columns]
+print("Shape:", df.shape)
 
+# ensure numeric
+df["decibel_level"] = pd.to_numeric(df["decibel_level"], errors="coerce")
+
+# parse datetime if present
 if "datetime" in df.columns:
     df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["hour"] = df["datetime"].dt.hour
+    df["day_of_week"] = df["datetime"].dt.dayofweek
+    df["is_weekend"] = df["day_of_week"].isin([5, 6]).astype(int)
 
-# Fill numeric missing values with column median
+# fill numeric missing values
 num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
 num_cols = [c for c in num_cols if c not in ("id", "sensor_id")]
 df[num_cols] = df[num_cols].fillna(df[num_cols].median())
 
-# Ensure decibel_level is float
-df["decibel_level"] = df["decibel_level"].astype(float)
-
-# ====================================================
-# 3. Generate synthetic vibration feature(s)
-# ====================================================
-# Idea:
-#   vibration_level is correlated with:
-#       - decibel_level (more noise -> more vibration)
-#       - traffic_density
-#       - heavy_vehicle_count
-#   plus some random noise (to look realistic)
-#   Units: synthetic "mm/s" (you can mention this in report)
-
-# Normalize helpers (safe for constant columns)
+# ---------- 2. Synthetic vibration (if you don’t already have real vibration) ----------
 def safe_minmax(x):
     x = np.asarray(x)
     if np.ptp(x) == 0:
         return np.zeros_like(x)
     return (x - x.min()) / (x.max() - x.min())
 
-noise_norm = safe_minmax(df["decibel_level"])
+if "vibration_level" not in df.columns:
+    noise_norm = safe_minmax(df["decibel_level"])
+    traffic = df["traffic_density"] if "traffic_density" in df.columns else np.zeros(len(df))
+    heavy   = df["heavy_vehicle_count"] if "heavy_vehicle_count" in df.columns else np.zeros(len(df))
 
-traffic = df["traffic_density"] if "traffic_density" in df.columns else 0
-heavy = df["heavy_vehicle_count"] if "heavy_vehicle_count" in df.columns else 0
+    traffic_norm = safe_minmax(traffic)
+    heavy_norm   = safe_minmax(heavy)
 
-traffic_norm = safe_minmax(traffic) if not np.isscalar(traffic) else 0
-heavy_norm = safe_minmax(heavy) if not np.isscalar(heavy) else 0
+    rng = np.random.default_rng(RANDOM_STATE)
+    random_comp = rng.normal(0, 0.3, size=len(df))
+
+    vibration_level = 0.5 + 2.0 * noise_norm + 1.5 * traffic_norm + 2.5 * heavy_norm + random_comp
+    vibration_level = np.clip(vibration_level, 0.1, None)
+
+    df["vibration_level"] = vibration_level
+    print("Synthetic vibration_level generated.")
+
+# ---------- 3. Add synthetic monument metadata (for training) ----------
+# In real deployment, you will provide real material + age per monument.
+
+materials = ["sandstone", "marble", "granite", "brick", "concrete"]
 
 rng = np.random.default_rng(RANDOM_STATE)
+df["material"] = rng.choice(materials, size=len(df), p=[0.25, 0.15, 0.20, 0.25, 0.15])
+# ages between 50 and 400 years
+df["age_years"] = rng.integers(50, 401, size=len(df))
 
-# Weighted sum of components
-noise_component   = 2.0 * noise_norm
-traffic_component = 1.5 * traffic_norm
-heavy_component   = 2.5 * heavy_norm
+# ---------- 4. Define rule-based impact function (for generating labels) ----------
 
-random_component  = rng.normal(loc=0.0, scale=0.3, size=len(df))
+def material_factor(material: str) -> float:
+    m = material.lower()
+    highly_sensitive = ["sandstone", "marble", "limestone", "old brick", "terracotta"]
+    medium = ["stone", "brick", "wood"]
+    low = ["granite", "concrete", "reinforced concrete", "steel", "metal"]
 
-vibration_level = 0.5 + noise_component + traffic_component + heavy_component + random_component
-vibration_level = np.clip(vibration_level, 0.1, None)  # avoid negative
+    if any(k in m for k in highly_sensitive):
+        return 1.3
+    if any(k in m for k in medium):
+        return 1.1
+    if any(k in m for k in low):
+        return 0.9
+    return 1.0
 
-df["vibration_level"] = vibration_level
+def age_factor(age_years: int) -> float:
+    if age_years >= 300:
+        return 1.3
+    elif age_years >= 100:
+        return 1.15
+    elif age_years >= 50:
+        return 1.0
+    else:
+        return 0.9
 
-# Optional: categorical vibration risk for analysis (not used as target here)
-# thresholds: <2 low, 2-4 medium, >4 high
-df["vibration_risk"] = pd.cut(
-    df["vibration_level"],
-    bins=[-1, 2, 4, 100],
-    labels=["Low", "Medium", "High"]
-).astype(str)
+def noise_factor(decibel: float) -> float:
+    if decibel < 60:
+        return 0.5
+    elif decibel < 75:
+        return 1.0
+    elif decibel <= 85:
+        return 1.3
+    else:
+        return 1.6
 
-print("\nSynthetic vibration_level stats:")
-print(df["vibration_level"].describe())
-print("\nVibration risk distribution:")
-print(df["vibration_risk"].value_counts())
+def vibration_factor(vib: float) -> float:
+    if vib < 1.5:
+        return 0.7
+    elif vib < 3.0:
+        return 1.0
+    elif vib < 5.0:
+        return 1.3
+    else:
+        return 1.6
 
-# ====================================================
-# 4. Noise risk label (classification target)
-# ====================================================
-low_th, high_th = NOISE_THRESHOLDS
-df["risk_level"] = pd.cut(
-    df["decibel_level"],
-    bins=[-1, low_th, high_th, 300],
-    labels=["Low", "Medium", "High"]
-).astype(str)
+def score_to_impact_label(score: float) -> str:
+    if score < 0.9:
+        return "Low impact"
+    elif score < 1.2:
+        return "Moderate impact"
+    elif score < 1.5:
+        return "High impact"
+    else:
+        return "Severe impact"
 
-print("\nNoise risk distribution:")
-print(df["risk_level"].value_counts())
+def compute_impact_row(row) -> str:
+    m_fac = material_factor(row["material"])
+    a_fac = age_factor(row["age_years"])
+    n_fac = noise_factor(row["decibel_level"])
+    v_fac = vibration_factor(row["vibration_level"])
 
-# ====================================================
-# 5. Time & other feature engineering
-# ====================================================
-if "datetime" in df.columns:
-    df["hour"]        = df["datetime"].dt.hour
-    df["day_of_week"] = df["datetime"].dt.dayofweek
-    df["is_weekend"]  = df["day_of_week"].isin([5, 6]).astype(int)
+    impact_score = 0.4 * n_fac + 0.4 * v_fac + 0.2 * (m_fac * a_fac)
+    return score_to_impact_label(impact_score)
 
-# cyclical hour features (important for time-of-day periodicity)
-if "hour" in df.columns:
-    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
-    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
+# compute labels
+df["impact_level"] = df.apply(compute_impact_row, axis=1)
+print("\nImpact level distribution:")
+print(df["impact_level"].value_counts())
 
-# sensor-level aggregation (how many readings per sensor)
-if "sensor_id" in df.columns:
-    df["sensor_id"] = df["sensor_id"].astype(str)
-    df["sensor_record_count"] = df.groupby("sensor_id")["decibel_level"].transform("count")
-
-# ====================================================
-# 6. Feature selection (X) and targets (y)
-# ====================================================
-
-candidate_features = [
-    "latitude", "longitude",
-    "hour", "hour_sin", "hour_cos", "day_of_week", "is_weekend",
-    "temperature_c", "humidity_%", "wind_speed_kmh",
-    "traffic_density", "vehicle_count", "heavy_vehicle_count",
-    "honking_events", "public_event", "holiday",
-    "school_zone", "noise_complaints",
-    "sensor_record_count",
-    "vibration_level"    # <-- synthetic vibration included in the model
+# ---------- 5. Build feature matrix X and target y ----------
+feature_cols = [
+    "decibel_level",
+    "vibration_level",
+    "temperature_c",
+    "humidity_%",
+    "wind_speed_kmh",
+    "traffic_density",
+    "vehicle_count",
+    "heavy_vehicle_count",
+    "honking_events",
+    "public_event",
+    "holiday",
+    "school_zone",
+    "noise_complaints",
+    "hour",
+    "day_of_week",
+    "is_weekend",
+    "material",
+    "age_years",
 ]
 
-feature_cols = [c for c in candidate_features if c in df.columns]
-print("\nUsing feature columns:")
-print(feature_cols)
+# keep only columns that exist
+feature_cols = [c for c in feature_cols if c in df.columns]
+print("\nUsing features:", feature_cols)
 
-# Drop rows where targets are missing
-df = df.dropna(subset=["decibel_level", "risk_level", "vibration_level"])
+df = df.dropna(subset=["impact_level"] + feature_cols)
 
-X      = df[feature_cols].copy()
-y_class = df["risk_level"].copy()      # classification target
-y_reg   = df["decibel_level"].copy()   # regression target
+X = df[feature_cols].copy()
+y = df["impact_level"].copy()
 
-# ====================================================
-# 7. Train-test split
-# ====================================================
-X_train, X_test, y_train_class, y_test_class, y_train_reg, y_test_reg = train_test_split(
-    X, y_class, y_reg,
+# split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
     test_size=0.2,
     random_state=RANDOM_STATE,
-    stratify=y_class
+    stratify=y
 )
 
+# numeric vs categorical
 numeric_features = X_train.select_dtypes(include=[np.number]).columns.tolist()
+categorical_features = [c for c in X_train.columns if c not in numeric_features]
+
+print("Numeric features:", numeric_features)
+print("Categorical features:", categorical_features)
+
+# ---------- 6. Preprocessor ----------
+numeric_transformer = StandardScaler()
+categorical_transformer = OneHotEncoder(handle_unknown="ignore")
 
 preprocessor = ColumnTransformer(
     transformers=[
-        ("num", StandardScaler(), numeric_features)
-    ],
-    remainder="drop"
+        ("num", numeric_transformer, numeric_features),
+        ("cat", categorical_transformer, categorical_features),
+    ]
 )
 
-# ====================================================
-# 8. Classification model (RandomForestClassifier)
-# ====================================================
-clf_pipe = Pipeline([
+# ---------- 7. Classifier + hyperparameter search ----------
+clf = RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1)
+
+pipe = Pipeline([
     ("pre", preprocessor),
-    ("clf", RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1))
+    ("clf", clf)
 ])
 
-clf_param_dist = {
-    "clf__n_estimators": [100, 200, 400],
-    "clf__max_depth": [None, 10, 20, 30],
+param_dist = {
+    "clf__n_estimators": [200, 400, 800],
+    "clf__max_depth": [None, 10, 20, 40],
     "clf__min_samples_split": [2, 5, 10],
     "clf__min_samples_leaf": [1, 2, 4],
 }
 
-print("\nTuning classifier (RandomizedSearchCV)...")
-clf_search = RandomizedSearchCV(
-    clf_pipe,
-    clf_param_dist,
-    n_iter=12,
-    cv=3,
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+
+search = RandomizedSearchCV(
+    pipe,
+    param_distributions=param_dist,
+    n_iter=20,
+    cv=cv,
     scoring="f1_macro",
     random_state=RANDOM_STATE,
     n_jobs=-1,
-    verbose=1
+    verbose=1,
 )
-clf_search.fit(X_train, y_train_class)
-best_clf = clf_search.best_estimator_
-print("\nBest classifier params:")
-print(clf_search.best_params_)
 
-# Evaluation
-y_pred = best_clf.predict(X_test)
-acc = accuracy_score(y_test_class, y_pred)
-f1  = f1_score(y_test_class, y_pred, average="macro")
+print("\nStarting RandomizedSearchCV for impact classifier...")
+search.fit(X_train, y_train)
+best_model = search.best_estimator_
+print("Best params:", search.best_params_)
 
-print("\n=== Classification Performance (Noise Risk) ===")
-print("Accuracy:", acc)
-print("F1 (macro):", f1)
-print("\nClassification report:\n", classification_report(y_test_class, y_pred))
+# ---------- 8. Evaluation ----------
+y_pred = best_model.predict(X_test)
 
-cm = confusion_matrix(y_test_class, y_pred, labels=["Low", "Medium", "High"])
-print("Confusion matrix (Low, Medium, High):\n", cm)
+print("\n=== Impact Classification Performance ===")
+print("Accuracy:", accuracy_score(y_test, y_pred))
+print("F1 (macro):", f1_score(y_test, y_pred, average="macro"))
+print("\nClassification report:\n", classification_report(y_test, y_pred))
+print("Confusion matrix:\n", confusion_matrix(y_test, y_pred,
+                                              labels=["Low impact","Moderate impact","High impact","Severe impact"]))
 
-# Save classifier
-clf_path = OUT_DIR / "noise_vibration_classifier.pkl"
-with open(clf_path, "wb") as f:
-    pickle.dump(best_clf, f)
-print("\nSaved classifier model to:", clf_path)
+# ---------- 9. Save model ----------
+model_path = OUT_DIR / "monument_impact_model.pkl"
+with open(model_path, "wb") as f:
+    pickle.dump({
+        "model": best_model,
+        "numeric_features": numeric_features,
+        "categorical_features": categorical_features,
+        "feature_cols": feature_cols,
+    }, f)
 
-# ====================================================
-# 9. Regression model (RandomForestRegressor)
-# ====================================================
-reg_pipe = Pipeline([
-    ("pre", preprocessor),
-    ("reg", RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=-1))
-])
-
-reg_param_dist = {
-    "reg__n_estimators": [100, 200, 400],
-    "reg__max_depth": [None, 10, 20],
-    "reg__min_samples_split": [2, 5, 10],
-}
-
-print("\nTuning regressor (RandomizedSearchCV)...")
-reg_search = RandomizedSearchCV(
-    reg_pipe,
-    reg_param_dist,
-    n_iter=8,
-    cv=3,
-    scoring="neg_root_mean_squared_error",
-    random_state=RANDOM_STATE,
-    n_jobs=-1,
-    verbose=1
-)
-reg_search.fit(X_train, y_train_reg)
-best_reg = reg_search.best_estimator_
-
-print("\nBest regressor params:")
-print(reg_search.best_params_)
-
-y_pred_reg = best_reg.predict(X_test)
-# Compute RMSE in a backward-compatible way (some sklearn versions do not accept `squared` kwarg)
-mse = mean_squared_error(y_test_reg, y_pred_reg)
-rmse = np.sqrt(mse)
-r2   = r2_score(y_test_reg, y_pred_reg)
-
-print("\n=== Regression Performance (Decibel) ===")
-print("RMSE:", rmse)
-print("R²:", r2)
-
-# Save regressor
-reg_path = OUT_DIR / "noise_vibration_regressor.pkl"
-with open(reg_path, "wb") as f:
-    pickle.dump(best_reg, f)
-print("Saved regressor model to:", reg_path)
-
-# ====================================================
-# 10. Feature importance (from classifier)
-# ====================================================
-clf_model = best_clf.named_steps["clf"]
-feature_names = numeric_features
-importances = clf_model.feature_importances_
-
-fi = pd.DataFrame({
-    "feature": feature_names,
-    "importance": importances
-}).sort_values("importance", ascending=False)
-
-print("\nTop feature importances (classifier):")
-print(fi.head(15))
-
-# Optional: visualize decibel distribution
-plt.figure()
-plt.hist(df["decibel_level"].dropna(), bins=40)
-plt.title("Distribution of decibel_level")
-plt.xlabel("Decibel (dB)")
-plt.ylabel("Count")
-plt.tight_layout()
-plt.show()
-
-print("\nArtifacts saved in:", OUT_DIR)
+print("\nSaved monument impact model to:", model_path)
